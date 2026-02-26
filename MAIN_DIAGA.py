@@ -274,7 +274,7 @@ class DLinkTelnetClient:
             # ищем трафик на порту
             res_packet_ports = re.search(r"RX Bytes.*?\d+\s+(\d+)", packet_ports)
             if res_packet_ports:
-                print(f"  PACKETS PORT: {res_packet_ports.group(1)}")
+                print(f"  PACKETS PORT: {round(int(res_packet_ports.group(1))*8/1000000, 2)} Mbs")
             else:
                 print("  PACKETS PORT: не определен")
 
