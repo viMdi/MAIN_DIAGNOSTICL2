@@ -106,7 +106,7 @@ class DLinkTelnetClient:
             print(f"  Connect to {self.host}...")
 
             # го telnet
-            self.session = pexpect.spawn(f"telnet {self.host}", timeout=5)
+            self.session = pexpect.spawn(f"telnet {self.host}", timeout=6)
 
             # приглашение логина
             self.session.expect("UserName:")
@@ -212,6 +212,37 @@ class DLinkTelnetClient:
         except Exception as e:
             print(f"  Ошибка при проверке dhcp: {e}")
 
+    def check_gateway_l3(self):
+        """ищем ип шлюза на л2"""
+        try:
+            self.session.expect(["5#", "admin#"], timeout=1)
+            self.session.sendline("")
+            self.session.expect(["5#", "admin#"], timeout=1)
+
+            # отправляем команду show switch
+            self.session.sendline("show switch")
+            time.sleep(0.5)
+            self.session.sendline("")  # Enter чтобы вернуться
+            self.session.expect(["5#", "admin#"], timeout=1)
+
+            res_gateway = self.session.before.decode("utf-8", errors="ignore")
+
+            # print("\n  DEBUG - DEF GATE:")
+            # print(repr(output))
+            # print("  END DEBUG\n")
+
+            # ищем шлюз
+            res_def_gate = re.search(
+                r"Default Gateway\s*:\s*(\S+)", res_gateway, re.IGNORECASE
+            )
+            if res_def_gate:
+                print(f"  DEF_GATEWEY: {res_def_gate.group(1)}")
+            else:
+                print("  DEF_GATEWAY: не определен")
+
+        except Exception as e:
+            print(f"  Ошибка при проверке default_gateway: {e}")
+
     def check_utilization_cpu(self):
         """проверка загрузки цп свитча)"""
 
@@ -271,14 +302,17 @@ class DLinkTelnetClient:
             self.session.expect(["5#", "admin#"], timeout=1)
             packet_ports = self.session.before.decode("utf-8", errors="ignore")
 
-            # ищем трафик на порту
-            res_packet_ports = re.search(r"RX Bytes.*?\d+\s+(\d+)", packet_ports)
-            if res_packet_ports:
-                print(
-                    f"  PACKETS PORT: {round(int(res_packet_ports.group(1)) * 8 / 1000000, 2)} Mbs"
-                )
-            else:
-                print("  PACKETS PORT: не определен")
+            # findall ищет все вхождения (RX и TX)
+            matches = re.findall(
+                r"(?:RX|TX) Bytes.*?\d+\s+(\d+)", packet_ports, re.IGNORECASE
+            )
+            rx_mbps = (
+                round(int(matches[0]) * 8 / 1000000, 1) if len(matches) > 0 else 0.0
+            )
+            tx_mbps = (
+                round(int(matches[1]) * 8 / 1000000, 1) if len(matches) > 1 else 0.0
+            )
+            print(f"  PACKETS PORT: RX {rx_mbps} Mbs | TX {tx_mbps} Mbs")
 
         except Exception as e:
             print(f"  Ошибка при проверке packets: {e}")
@@ -369,12 +403,13 @@ class DLinkTelnetClient:
 
         self.check_port_status(port)
         self.check_mac_addresses(port)
+        self.check_vlan_on_port(port)
+        self.check_dhcp_relay()
         self.check_errors_port(port)
         self.check_packet_port(port)
-        self.check_dhcp_relay()
-        self.check_vlan_on_port(port)
         self.check_utilization_cpu()
         self.check_cable_diagnostic(port)
+        self.check_gateway_l3()
 
         print("\n  " + "=" * 50)
         # print("  diagnostic successfull")
