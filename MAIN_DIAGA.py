@@ -215,21 +215,16 @@ class DLinkTelnetClient:
     def check_gateway_l3(self):
         """ищем ип шлюза на л2"""
         try:
-            self.session.expect(["5#", "admin#"], timeout=1)
+            # клир буфер перед отправкой команды
             self.session.sendline("")
+            time.sleep(0.3)
             self.session.expect(["5#", "admin#"], timeout=1)
 
             # отправляем команду show switch
             self.session.sendline("show switch")
             time.sleep(0.5)
-            self.session.sendline("")  # Enter чтобы вернуться
             self.session.expect(["5#", "admin#"], timeout=1)
-
             res_gateway = self.session.before.decode("utf-8", errors="ignore")
-
-            # print("\n  DEBUG - DEF GATE:")
-            # print(repr(output))
-            # print("  END DEBUG\n")
 
             # ищем шлюз
             res_def_gate = re.search(
@@ -341,9 +336,9 @@ class DLinkTelnetClient:
                 cab_diag,
                 re.DOTALL | re.IGNORECASE,
             )
-            #
+
             if cab_diag_port:
-                result = cab_diag_port.group(1).strip()
+                result = cab_diag_port.group(1)
                 print(f"  CABLE DIAG: {result}")
             else:
                 print("  CABLE DIAG: информация не найдена")
@@ -355,14 +350,10 @@ class DLinkTelnetClient:
         """проверка VLAN на порту (show vlan ports)"""
 
         try:
+            # сразу отправляем команду show vlan ports
             self.session.sendline(f"show vlan ports {port}")
             self.session.expect(["5#", "admin#"], timeout=1)
             data_vlan = self.session.before.decode("utf-8", errors="ignore")
-
-            # ВРЕМЕННО: посмотрим что приходит
-            # print("\n  DEBUG - VLAN DATA:")
-            # print(data_vlan)
-            # print("  END DEBUG\n")
 
             # универсальная регулярка под разные свитчи
             vlan_matches = re.findall(
@@ -372,7 +363,7 @@ class DLinkTelnetClient:
             # если не зарегало по универсальной, то пробуем второй (с номером порта в начале строки)
             if not vlan_matches:
                 vlan_matches = re.findall(
-                    r"^\s*\d+\s+(\d+)\s+([X-])\s+([X-])", data_vlan, re.MULTILINE
+                    r"^\s*\d+(?::\d+)?\s+(\d+)\s+([X-])\s+([X-])", data_vlan, re.MULTILINE
                 )
 
             if vlan_matches:
@@ -405,11 +396,11 @@ class DLinkTelnetClient:
         self.check_mac_addresses(port)
         self.check_vlan_on_port(port)
         self.check_dhcp_relay()
+        self.check_gateway_l3()
         self.check_errors_port(port)
         self.check_packet_port(port)
         self.check_utilization_cpu()
         self.check_cable_diagnostic(port)
-        self.check_gateway_l3()
 
         print("\n  " + "=" * 50)
         # print("  diagnostic successfull")
