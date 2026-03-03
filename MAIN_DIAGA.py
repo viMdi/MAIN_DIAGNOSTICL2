@@ -47,7 +47,7 @@ class DatabaseClient:
         # добавить запрос из бд по ип свитча и вывод его имя
         try:
             with self.connection.cursor() as cursor:
-                sql = "SELECT PortP, switch, IP, gate, Add_IP, dhcp_type FROM users WHERE number = %s"
+                sql = "SELECT PortP, SwitchP, IP, gate, Add_IP, dhcp_type FROM users WHERE number = %s"
                 cursor.execute(sql, (number,))
                 rows = cursor.fetchall()
 
@@ -55,7 +55,7 @@ class DatabaseClient:
                     user_data = {
                         "switch_name": None,  # сюда потом запишем имя свитча
                         "port": row.get("PortP") or "",
-                        "switch": row.get("switch") or "",
+                        "switch": row.get("SwitchP") or "",
                         "ip": row.get("IP") or "",
                         "gate": row.get("gate") or "",
                         "add_ip": row.get("Add_IP") or "",
@@ -72,7 +72,7 @@ class DatabaseClient:
         """поиск имени свитча по IP-адресу"""
         try:
             with self.connection.cursor() as cursor:
-                # Используем LIKE для поиска по началу IP
+                # используем LIKE для поиска по началу IP
                 sql = "SELECT name FROM switches WHERE IP LIKE %s"
                 cursor.execute(sql, (f"{ip_address}%",))
                 row = cursor.fetchone()
@@ -301,13 +301,13 @@ class DLinkTelnetClient:
             matches = re.findall(
                 r"(?:RX|TX) Bytes.*?\d+\s+(\d+)", packet_ports, re.IGNORECASE
             )
-            rx_mbps = (
-                round(int(matches[0]) * 8 / 1000000, 1) if len(matches) > 0 else 0.0
-            )
-            tx_mbps = (
-                round(int(matches[1]) * 8 / 1000000, 1) if len(matches) > 1 else 0.0
-            )
-            print(f"  PACKETS PORT: RX {rx_mbps} Mbs | TX {tx_mbps} Mbs")
+            rx_bytes = int(matches[0]) if len(matches) > 0 else 0
+            tx_bytes = int(matches[1]) if len(matches) > 1 else 0
+
+            rx_mbps = round(rx_bytes * 8 / 1000000, 1)
+            tx_mbps = round(tx_bytes * 8 / 1000000, 1)
+
+            print(f"  PACKETS PORT: RX {rx_bytes} bytes ({rx_mbps} Mbs) | TX {tx_bytes} bytes ({tx_mbps} Mbs)")
 
         except Exception as e:
             print(f"  Ошибка при проверке packets: {e}")
