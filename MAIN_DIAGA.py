@@ -124,8 +124,8 @@ class DLinkTelnetClient:
             self.connected = True
             return True
 
-        except Exception as e:
-            print(f"  Ошибка подключения: {e}")
+        except Exception:
+            print(f"  Свитч упал: {self.host}")
             return False
 
     def disconnect(self):
