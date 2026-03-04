@@ -132,6 +132,7 @@ class DLinkTelnetClient:
 								if self.session and self.connected:
 												try:
 																self.session.sendline("enable clipaging")
+																self.session.sendline("\r")
 																self.session.expect(["5#", "admin#", "#", "Switch#"], timeout=1)
 																self.session.sendline("logout")
 																self.session.sendline("exit")
@@ -147,7 +148,13 @@ class DLinkTelnetClient:
 								try:
 												# клир буфер перед отправкой команды
 												self.session.sendline("")
-												self.session.expect(["5#", "admin#"], timeout=1)
+												try:
+																self.session.expect(["5#", "admin#"], timeout=1)
+												except:
+																# если таймаут, пробуем восстановить соединение
+																self.session.sendline("\r")
+																time.sleep(0.5)
+																self.session.expect(["5#", "admin#"], timeout=1)
 
 												# отправляем команду show ports
 												self.session.sendline(f"show ports {port}")
@@ -163,6 +170,9 @@ class DLinkTelnetClient:
 
 								except Exception as e:
 												print(f"  Ошибка при проверке порта: {e}")
+												# пробуем переподключиться
+												self.session.sendline("\r")
+												time.sleep(1)
 
 				def check_mac_addresses(self, port):
 								"""Проверка MAC-адресов на порту (show fdb port)"""
@@ -228,6 +238,11 @@ class DLinkTelnetClient:
 												self.session.expect(["5#", "admin#"], timeout=1)
 												res_gateway = self.session.before.decode("utf-8", errors="ignore")
 
+												# временная отладка
+												# print("\n  DEBUG - SHOW SWITCH OUTPUT:")
+												# print(res_gateway)
+												# print("  END DEBUG\n")
+
 												# ищем шлюз
 												res_def_gate = re.search(
 																r"Default Gateway\s*:\s*(\S+)", res_gateway, re.IGNORECASE
@@ -242,7 +257,7 @@ class DLinkTelnetClient:
 												print(f"  Ошибка при проверке default_gateway: {e}")
 
 				def check_arp_on_gateway(self, user_ip, mac_from_l2):
-								"""подключение к L3 коммутатору и проверка ARP записи"""
+								"""подключение к L3 свитчу и проверка ARP записи"""
 								if not self.gateway_ip:
 												return
 
@@ -265,11 +280,14 @@ class DLinkTelnetClient:
 																				gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=1)
 																				arp_data = gw.session.before.decode("utf-8", errors="ignore")
 
-																# ищем MAC и проверяем IP
+																# ищем мак и проверяем ип, пропуская строки с командами
 																arp_mac = None
 																ip_found = False
 
 																for line in arp_data.split('\n'):
+																				# пропускаем строки с командами
+																				if "show arpentry" in line or "sh arp" in line or "Command:" in line:
+																								continue
 																				if user_ip in line:
 																								ip_found = True
 																								mac_match = re.search(r"((?:[A-F0-9]{2}[-]){5}[A-F0-9]{2})", line, re.IGNORECASE)
@@ -277,7 +295,85 @@ class DLinkTelnetClient:
 																												arp_mac = mac_match.group(1).upper()
 																												break
 
-																if not mac_from_l2:
+																# если арп не найден, пробуем найти маршрут
+																if not ip_found and not arp_mac:
+																				gw.session.sendline(f"show iproute {user_ip}")
+																				time.sleep(0.5)
+																				gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=1)
+																				route_data = gw.session.before.decode("utf-8", errors="ignore")
+
+																				# ищем ип gateway
+																				gateway_match = re.search(r"\d+\.\d+\.\d+\.\d+/\d+\s+(\d+\.\d+\.\d+\.\d+)", route_data)
+
+																				if gateway_match:
+																								new_gateway = gateway_match.group(1)
+																								print(f"  ARP: найден шлюз {new_gateway}, пробуем подключиться...")
+
+																								# закрываем текущее соединение
+																								try:
+																												gw.session.sendline("logout")
+																												gw.session.close()
+																								except:
+																												pass
+
+																								# создаем новое подключение к найденному шлюзу
+																								new_gw = DLinkTelnetClient(new_gateway)
+
+																								if new_gw.connect():
+																												# пробуем первую команду на новом шлюзе
+																												new_gw.session.sendline(f"show arpentry ipaddress {user_ip}")
+																												time.sleep(0.5)
+																												new_gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=1)
+																												new_arp_data = new_gw.session.before.decode("utf-8", errors="ignore")
+
+																												# если не сработало, пробуем вторую
+																												if "Invalid" in new_arp_data or "^" in new_arp_data or not new_arp_data.strip():
+																																new_gw.session.sendline(f"sh arp {user_ip}")
+																																time.sleep(0.5)
+																																new_gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=1)
+																																new_arp_data = new_gw.session.before.decode("utf-8", errors="ignore")
+
+																												# ищем мак на новом шлюзе, пропуская строки с командами
+																												new_arp_mac = None
+																												new_ip_found = False
+
+																												for line in new_arp_data.split('\n'):
+																																if "show arpentry" in line or "sh arp" in line or "Command:" in line:
+																																				continue
+																																if user_ip in line:
+																																				new_ip_found = True
+																																				mac_match = re.search(r"((?:[A-F0-9]{2}[-]){5}[A-F0-9]{2})", line, re.IGNORECASE)
+																																				if mac_match:
+																																								new_arp_mac = mac_match.group(1).upper()
+																																								break
+
+																												# выводим результат
+																												if not mac_from_l2:
+																																print("  ARP: отсутствует (нет MAC на L2)")
+																												elif not new_ip_found:
+																																print("  ARP: отсутствует (IP не найден на доп. шлюзе)")
+																												elif new_arp_mac and new_arp_mac in mac_from_l2 and new_ip_found:
+																																print("  ARP: OK (IP и MAC совпадают) - найдено на доп. шлюзе")
+																												elif new_arp_mac:
+																																print(f"  ARP: НЕ СООТВЕТСТВУЕТ (L2: {', '.join(mac_from_l2)} | L3: {new_arp_mac}) - на доп. шлюзе")
+																												else:
+																																print("  ARP: отсутствует (запись не найдена) - на доп. шлюзе")
+
+																												# закрываем соединение с новым шлюзом
+																												try:
+																																new_gw.session.sendline("logout")
+																																new_gw.session.close()
+																												except:
+																																pass
+
+																												return
+																								else:
+																												print(f"  ARP: не удалось подключиться к шлюзу {new_gateway}")
+																				else:
+																								print("  ARP: маршрут не найден")
+
+																# если ара найдена на первом шлюзе, выводим результат
+																elif not mac_from_l2:
 																				print("  ARP: отсутствует (нет MAC на L2)")
 
 																elif not ip_found:
@@ -295,7 +391,7 @@ class DLinkTelnetClient:
 																else:
 																				print("  ARP: отсутствует (запись не найдена)")
 
-																# закрываем соединение
+																# закрываем соединение с первым шлюзом
 																try:
 																				gw.session.sendline("logout")
 																				gw.session.close()
@@ -450,7 +546,7 @@ class DLinkTelnetClient:
 								except Exception as e:
 												print(f"  Ошибка при проверке VLAN: {e}")
 
-				def run_diagnostic(self, port, user_ip):
+				def run_diagnostic(self, port, user_ip=None):
 								"""запуск диагностики порта"""
 								if not self.connected:
 												print("  NE CONNECTIT")
@@ -461,18 +557,19 @@ class DLinkTelnetClient:
 								print()
 
 								self.check_port_status(port)
-								mac_list = self.check_mac_addresses(port)
+								mac_list = self.check_mac_addresses(port)  # 👈 получаем MAC здесь
 								self.check_vlan_on_port(port)
 								self.check_dhcp_relay()
-								self.check_gateway_l3()
-								self.check_arp_on_gateway(user_ip, mac_list)
 								self.check_errors_port(port)
 								self.check_packet_port(port)
+								self.check_gateway_l3()
 								self.check_utilization_cpu()
 								self.check_cable_diagnostic(port)
 
+								if hasattr(self, 'gateway_ip') and self.gateway_ip:
+												self.check_arp_on_gateway(user_ip, mac_list)  # 👈 используем mac_list
+
 								print("\n  " + "=" * 50)
-								# print("  diagnostic successfull")
 
 
 # ==================== MAIN PROG ====================
