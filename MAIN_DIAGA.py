@@ -115,7 +115,7 @@ class DLinkTelnetClient:
 												self.session.sendline(self.password)
 												# промпт
 												self.session.expect(["5#", "admin#", "#", ">", "Switch#"], timeout=1)
-												# отключаем pagination
+												# отключаем pagination добавить флаг на gw в true
 												self.session.sendline("disable clipaging")
 												self.session.expect(["5#", "admin#", "#", "Switch#"], timeout=1)
 
@@ -131,6 +131,7 @@ class DLinkTelnetClient:
 								"""закрыть соединение или остаться в интерактивном"""
 								if self.session and self.connected:
 												try:
+																# добавить флаг на gw True 
 																self.session.sendline("enable clipaging")
 																self.session.sendline("\r")
 																self.session.expect(["5#", "admin#", "#", "Switch#"], timeout=1)
