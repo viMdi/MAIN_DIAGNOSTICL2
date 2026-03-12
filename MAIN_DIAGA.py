@@ -8,13 +8,21 @@ import time
 import re
 import cfg
 
+# Константы таймаутов (в секундах)
+TIMEOUTS = {
+	'PROMPT': 1,
+	'COMMAND': 1,
+	'LOG': 2,
+	'ACCESS': 4,
+	'CABLE': 1,
+	'RECOVERY': 0.5
+}
 
 # ==================== КЛАСС ДЛЯ РАБОТЫ С БД ====================
 
-
 class DatabaseClient:
 	"""класс для работы с бд"""
-
+	# ... (класс без изменений, он и так ок)
 	def __init__(self, config):
 		self.config = config
 		self.connection = None
@@ -43,7 +51,6 @@ class DatabaseClient:
 	def get_user_by_number(self, number):
 		"""поиск члена по намберу возвращает список словарей с данными членов"""
 		results = []
-		# добавить запрос из бд по ип свитча и вывод его имя
 		try:
 			with self.connection.cursor() as cursor:
 				sql = "SELECT PortP, SwitchP, IP, gate, Add_IP, dhcp_type FROM users WHERE number = %s"
@@ -52,7 +59,7 @@ class DatabaseClient:
 
 				for row in rows:
 					user_data = {
-						"switch_name": None,  # сюда потом запишем имя свитча
+						"switch_name": None,
 						"port": row.get("PortP") or "",
 						"switch": row.get("SwitchP") or "",
 						"ip": row.get("IP") or "",
@@ -71,7 +78,6 @@ class DatabaseClient:
 		"""поиск имени свитча по IP-адресу"""
 		try:
 			with self.connection.cursor() as cursor:
-				# используем LIKE для поиска по началу IP
 				sql = "SELECT name FROM switches WHERE IP LIKE %s"
 				cursor.execute(sql, (f"{ip_address}%",))
 				row = cursor.fetchone()
@@ -88,16 +94,32 @@ class DatabaseClient:
 
 # ==================== КЛАСС ДЛЯ РАБОТЫ СО СВИТЧОМ ====================
 
-
 class DLinkTelnetClient:
-	def __init__(self, host, disable_paging=True):  #
+	def __init__(self, host, disable_paging=True):
 		self.host = host
-		self.disable_paging = disable_paging  #
+		self.disable_paging = disable_paging
 		self.username = cfg.SWITCH_USERNAME
 		self.password = cfg.SWITCH_PASSWORD
 		self.session = None
 		self.connected = False
 		self.gateway_ip = None
+
+	def _ensure_prompt(self):
+		"""гарантирует, что мы в промпте перед командой"""
+		try:
+			self.session.sendline("")
+			self.session.expect(["5#", "admin#", "#", "Switch#"], timeout=TIMEOUTS['PROMPT'])
+			return True
+		except:
+			# пробуем восстановиться
+			try:
+				self.session.sendcontrol('c')
+				time.sleep(TIMEOUTS['RECOVERY'])
+				self.session.sendline("")
+				self.session.expect(["5#", "admin#", "#", "Switch#"], timeout=TIMEOUTS['PROMPT'])
+				return True
+			except:
+				return False
 
 	def connect(self, quiet=False):
 		try:
@@ -109,12 +131,11 @@ class DLinkTelnetClient:
 			self.session.sendline(self.username)
 			self.session.expect(r"[Pp]ass[Ww]ord")
 			self.session.sendline(self.password)
-			self.session.expect(["5#", "admin#", "#", ">", "Switch#"], timeout=1)
+			self.session.expect(["5#", "admin#", "#", ">", "Switch#"], timeout=TIMEOUTS['PROMPT'])
 
-			#  отключаем paging только если флаг True
 			if self.disable_paging:
 				self.session.sendline("disable clipaging")
-				self.session.expect(["5#", "admin#", "#", "Switch#"], timeout=1)
+				self.session.expect(["5#", "admin#", "#", "Switch#"], timeout=TIMEOUTS['PROMPT'])
 
 			if not quiet:
 				print("  SUCCESSFUL")
@@ -130,10 +151,9 @@ class DLinkTelnetClient:
 		"""закрыть соединение или остаться в интерактивном"""
 		if self.session and self.connected:
 			try:
-				# добавить флаг на gw True
 				self.session.sendline("enable clipaging")
 				self.session.sendline("\r")
-				self.session.expect(["5#", "admin#", "#", "Switch#"], timeout=1)
+				self.session.expect(["5#", "admin#", "#", "Switch#"], timeout=TIMEOUTS['PROMPT'])
 				self.session.sendline("logout")
 				self.session.sendline("exit")
 				self.session.close()
@@ -146,22 +166,13 @@ class DLinkTelnetClient:
 	def check_port_status(self, port):
 		"""проверка статуса порта (show ports)"""
 		try:
-			# клир буфер перед отправкой команды
-			self.session.sendline("")
-			try:
-				self.session.expect(["5#", "admin#"], timeout=1)
-			except:
-				# если таймаут, пробуем восстановить соединение
-				self.session.sendline("\r")
-				time.sleep(0.5)
-				self.session.expect(["5#", "admin#"], timeout=1)
+			if not self._ensure_prompt():
+				return
 
-			# отправляем команду show ports
 			self.session.sendline(f"show ports {port}")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			data_port = self.session.before.decode("utf-8", errors="ignore")
 
-			# статус линка
 			res = re.search(r"\b\d+[M]\S+|(Li\S+.\S+)", data_port)
 			if res:
 				print(f"  LINK STATUS: {res.group()}")
@@ -170,22 +181,18 @@ class DLinkTelnetClient:
 
 		except Exception as e:
 			print(f"  Ошибка при проверке порта: {e}")
-			# пробуем переподключиться
-			self.session.sendline("\r")
-			time.sleep(1)
+			self._ensure_prompt()
 
 	def check_mac_addresses(self, port):
 		"""Проверка MAC-адресов на порту (show fdb port)"""
 		try:
-			# клир буфер перед отправкой команды
-			self.session.sendline("")
-			self.session.expect(["5#", "admin#"], timeout=1)
-			# отправляем команду show fdb port
+			if not self._ensure_prompt():
+				return []
+
 			self.session.sendline(f"show fdb port {port}")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			data_fdb = self.session.before.decode("utf-8", errors="ignore")
 
-			# ищем все MAC-адреса
 			res_mac = re.findall(
 				r"^\s*\d+\s+\S+\s+((?:[A-F0-9]{2}[-]){5}[A-F0-9]{2})",
 				data_fdb,
@@ -196,14 +203,12 @@ class DLinkTelnetClient:
 				mac_list = [mac.upper() for mac in res_mac]
 				total = len(mac_list)
 
-				# ищем тип порта на порт секурити (Dynamic или Permanent)
 				type_match = re.search(r"(Dynamic|Permanent)", data_fdb, re.IGNORECASE)
 				mac_type = type_match.group(1) if type_match else "no result"
 
-				# выводим первые 4 MAC, остальные в скобках
 				if total > 4:
 					first_four = mac_list[:4]
-					print(f"  MAC: {', '.join(first_four)} (+{total-4})")
+					print(f"  MAC: {', '.join(first_four)} (+{total - 4})")
 				else:
 					print(f"  MAC: {', '.join(mac_list)}")
 
@@ -214,22 +219,19 @@ class DLinkTelnetClient:
 				return []
 		except Exception as e:
 			print(f"  Ошибка при поиске MAC-адресов: {e}")
+			self._ensure_prompt()
 			return []
-
 
 	def check_dhcp_relay(self):
 		"""проверка dhcp_relay на enable/disable (show dhcp_relay)"""
 		try:
-			# клир буфер перед отправкой команды
-			self.session.sendline("")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			if not self._ensure_prompt():
+				return
 
-			# отправляем команду show dhcp_relay
 			self.session.sendline("show dhcp_relay")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			dhcp_relay = self.session.before.decode("utf-8", errors="ignore")
 
-			# вывод статуса dhcp
 			res_dhcp = re.search(r"R\S+\s\S+\s+[:].(\S+)", dhcp_relay)
 			if res_dhcp:
 				print(f"  DHCP_RELAY: {res_dhcp.group(1)}")
@@ -238,27 +240,19 @@ class DLinkTelnetClient:
 
 		except Exception as e:
 			print(f"  Ошибка при проверке dhcp: {e}")
+			self._ensure_prompt()
 
 	def check_gateway_l3(self):
 		"""ищем ип шлюза на л2"""
 		try:
-			# клир буфер перед отправкой команды
-			self.session.sendline("")
-			time.sleep(0.3)
-			self.session.expect(["5#", "admin#"], timeout=1)
+			if not self._ensure_prompt():
+				return
 
-			# отправляем команду show switch
 			self.session.sendline("show switch")
-			time.sleep(0.5)
-			self.session.expect(["5#", "admin#"], timeout=1)
+			time.sleep(0.3)
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			res_gateway = self.session.before.decode("utf-8", errors="ignore")
 
-			# временная отладка
-			# print("\n  DEBUG - SHOW SWITCH OUTPUT:")
-			# print(res_gateway)
-			# print("  END DEBUG\n")
-
-			# ищем шлюз
 			res_def_gate = re.search(
 				r"Default Gateway\s*:\s*(\S+)", res_gateway, re.IGNORECASE
 			)
@@ -270,6 +264,7 @@ class DLinkTelnetClient:
 
 		except Exception as e:
 			print(f"  Ошибка при проверке default_gateway: {e}")
+			self._ensure_prompt()
 
 	def check_arp_on_gateway(self, user_ip, mac_from_l2):
 		"""подключение к L3 свитчу и проверка ARP записи"""
@@ -282,30 +277,22 @@ class DLinkTelnetClient:
 			if gw.connect(quiet=True):
 				arp_data = ""
 
-				# пробуем первую команду
 				gw.session.sendline(f"show arpentry ipaddress {user_ip}")
-				time.sleep(0.5)
-				gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=1)
+				time.sleep(0.3)
+				gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=TIMEOUTS['COMMAND'])
 				arp_data = gw.session.before.decode("utf-8", errors="ignore")
 
-				# если не сработало, пробуем вторую
 				if "Invalid" in arp_data or "^" in arp_data or not arp_data.strip():
 					gw.session.sendline(f"sh arp {user_ip}")
-					time.sleep(0.5)
-					gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=1)
+					time.sleep(0.3)
+					gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=TIMEOUTS['COMMAND'])
 					arp_data = gw.session.before.decode("utf-8", errors="ignore")
 
-				# ищем мак и проверяем ип, пропуская строки с командами
 				arp_mac = None
 				ip_found = False
 
 				for line in arp_data.split("\n"):
-					# пропускаем строки с командами
-					if (
-						"show arpentry" in line
-						or "sh arp" in line
-						or "Command:" in line
-					):
+					if "show arpentry" in line or "sh arp" in line or "Command:" in line:
 						continue
 					if user_ip in line:
 						ip_found = True
@@ -316,72 +303,45 @@ class DLinkTelnetClient:
 							arp_mac = mac_match.group(1).upper()
 							break
 
-				# если арп не найден, пробуем найти маршрут
 				if not ip_found and not arp_mac:
 					gw.session.sendline(f"show iproute {user_ip}")
-					time.sleep(0.5)
-					gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=1)
+					time.sleep(0.3)
+					gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=TIMEOUTS['COMMAND'])
 					route_data = gw.session.before.decode("utf-8", errors="ignore")
 
-					# ищем ип gateway
 					gateway_match = re.search(
 						r"\d+\.\d+\.\d+\.\d+/\d+\s+(\d+\.\d+\.\d+\.\d+)", route_data
 					)
 
 					if gateway_match:
 						new_gateway = gateway_match.group(1)
-						print(
-							f"  ARP: gateway found {new_gateway}, trying to connect..."
-						)
+						print(f"  ARP: gateway found {new_gateway}, trying to connect...")
 
-						# закрываем текущее соединение
 						try:
 							gw.session.sendline("logout")
 							gw.session.close()
 						except:
 							pass
 
-						# создаем новое подключение к найденному шлюзу
 						new_gw = DLinkTelnetClient(new_gateway, disable_paging=False)
 
 						if new_gw.connect(quiet=True):
-							# пробуем первую команду на новом шлюзе
-							new_gw.session.sendline(
-								f"show arpentry ipaddress {user_ip}"
-							)
-							time.sleep(0.5)
-							new_gw.session.expect(
-								["5#", "admin#", "Switch#", "#"], timeout=1
-							)
-							new_arp_data = new_gw.session.before.decode(
-								"utf-8", errors="ignore"
-							)
+							new_gw.session.sendline(f"show arpentry ipaddress {user_ip}")
+							time.sleep(0.3)
+							new_gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=TIMEOUTS['COMMAND'])
+							new_arp_data = new_gw.session.before.decode("utf-8", errors="ignore")
 
-							# если не сработало, пробуем вторую
-							if (
-								"Invalid" in new_arp_data
-								or "^" in new_arp_data
-								or not new_arp_data.strip()
-							):
+							if "Invalid" in new_arp_data or "^" in new_arp_data or not new_arp_data.strip():
 								new_gw.session.sendline(f"sh arp {user_ip}")
-								time.sleep(0.5)
-								new_gw.session.expect(
-									["5#", "admin#", "Switch#", "#"], timeout=1
-								)
-								new_arp_data = new_gw.session.before.decode(
-									"utf-8", errors="ignore"
-								)
+								time.sleep(0.3)
+								new_gw.session.expect(["5#", "admin#", "Switch#", "#"], timeout=TIMEOUTS['COMMAND'])
+								new_arp_data = new_gw.session.before.decode("utf-8", errors="ignore")
 
-							# ищем мак на новом шлюзе, пропуская строки с командами
 							new_arp_mac = None
 							new_ip_found = False
 
 							for line in new_arp_data.split("\n"):
-								if (
-									"show arpentry" in line
-									or "sh arp" in line
-									or "Command:" in line
-								):
+								if "show arpentry" in line or "sh arp" in line or "Command:" in line:
 									continue
 								if user_ip in line:
 									new_ip_found = True
@@ -394,29 +354,17 @@ class DLinkTelnetClient:
 										new_arp_mac = mac_match.group(1).upper()
 										break
 
-							# выводим результат
 							if not mac_from_l2:
 								print("  ARP: no result (no MAC on L2)")
 							elif not new_ip_found:
 								print("  ARP: no result (IP not found on secondary gateway)")
-							elif (
-								new_arp_mac
-								and new_arp_mac in mac_from_l2
-								and new_ip_found
-							):
-								print(
-									"  ARP: OK (IP and MAC match) - found on secondary gateway"
-								)
+							elif new_arp_mac and new_arp_mac in mac_from_l2 and new_ip_found:
+								print("  ARP: OK (IP and MAC match) - found on secondary gateway")
 							elif new_arp_mac:
-								print(
-									f"  ARP: NOT MATCH (L2: {', '.join(mac_from_l2)} | L3: {new_arp_mac}) - on secondary gateway"
-								)
+								print(f"  ARP: NOT MATCH (L2: {', '.join(mac_from_l2)} | L3: {new_arp_mac}) - on secondary gateway")
 							else:
-								print(
-									"  ARP: no result (arpentry not found) - on secondary gateway"
-								)
+								print("  ARP: no result (arpentry not found) - on secondary gateway")
 
-							# закрываем соединение с новым шлюзом
 							try:
 								new_gw.session.sendline("logout")
 								new_gw.session.close()
@@ -425,36 +373,23 @@ class DLinkTelnetClient:
 
 							return
 						else:
-							print(
-								f"  ARP: failed to connect to the gateway {new_gateway}"
-							)
+							print(f"  ARP: failed to connect to the gateway {new_gateway}")
 					else:
 						print("  ARP: route not found")
 
-				# если ара найдена на первом шлюзе, выводим результат
 				elif not mac_from_l2:
 					print("  ARP: no result (no MAC on L2)")
-
 				elif not ip_found:
 					print("  ARP: no result (IP not found on L3)")
-
 				elif len(mac_from_l2) > 5:
-					print(
-						f"  ARP: {arp_mac if arp_mac else 'MAC not found'} (on port {len(mac_from_l2)} MAC-address, check the port manually)"
-					)
-
+					print(f"  ARP: {arp_mac if arp_mac else 'MAC not found'} (on port {len(mac_from_l2)} MAC-address, check the port manually)")
 				elif arp_mac and arp_mac in mac_from_l2 and ip_found:
 					print("  ARP: OK (IP and MAC match)")
-
 				elif arp_mac:
-					print(
-						f"  ARP: NOT MATCH (L2: {', '.join(mac_from_l2)} | L3: {arp_mac})"
-					)
-
+					print(f"  ARP: NOT MATCH (L2: {', '.join(mac_from_l2)} | L3: {arp_mac})")
 				else:
 					print("  ARP: no result (arpentry not found)")
 
-				# закрываем соединение с первым шлюзом
 				try:
 					gw.session.sendline("logout")
 					gw.session.close()
@@ -467,16 +402,13 @@ class DLinkTelnetClient:
 	def check_utilization_cpu(self):
 		"""проверка загрузки цп свитча)"""
 		try:
-			# клир буфер перед отправкой команды
-			self.session.sendline("")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			if not self._ensure_prompt():
+				return
 
-			# отправляем команду show utilization cpu
 			self.session.sendline("show utilization cpu")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			utilization_cpu = self.session.before.decode("utf-8", errors="ignore")
 
-			# ищем загрузку цп
 			res_util_cpu = re.search(r"Five.*?(\d+\s*%)", utilization_cpu)
 			if res_util_cpu:
 				print(f"  UTIL_CPU: {res_util_cpu.group(1)}")
@@ -485,20 +417,18 @@ class DLinkTelnetClient:
 
 		except Exception as e:
 			print(f"  Ошибка при проверке utilization_cpu: {e}")
+			self._ensure_prompt()
 
 	def check_errors_port(self, port):
 		"""Проверка ошибок на порту (show error ports)"""
 		try:
-			# клир буфер перед отправкой команды
-			self.session.sendline("")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			if not self._ensure_prompt():
+				return
 
-			# отправляем команду show error ports
 			self.session.sendline(f"show error ports {port}")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			error_ports = self.session.before.decode("utf-8", errors="ignore")
 
-			# ищем ошибки на порту
 			res_error_ports = re.search(r"CRC Error\s+(\d+)", error_ports)
 			if res_error_ports:
 				print(f"  ERRORS PORT: {res_error_ports.group(1)}")
@@ -506,67 +436,58 @@ class DLinkTelnetClient:
 				print("  ERRORS PORT: not defined")
 		except Exception as e:
 			print(f"  Ошибка при проверке error: {e}")
+			self._ensure_prompt()
 
 	def check_len_log(self, port):
-			"""проверка на кол-во падения линка в логах"""
+		"""проверка на кол-во падения линка в логах"""
+		try:
+			self.session.sendline("enable clipaging")
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['PROMPT'])
+
+			if not self._ensure_prompt():
+				return
+
+			self.session.sendline("show log")
+			self.session.sendline("n")
+			time.sleep(TIMEOUTS['LOG'])
+
 			try:
-					# включаем clipaging (чтобы был постраничный вывод)
-					self.session.sendline("enable clipaging")
-					self.session.expect(["5#", "admin#"], timeout=1)
+				output = self.session.read_nonblocking(size=10000, timeout=TIMEOUTS['LOG']).decode(
+					errors="ignore"
+				)
+			except:
+				output = ""
 
-					# очищаем буфер
-					self.session.sendline("")
-					self.session.expect(["5#", "admin#"], timeout=1)
+			self.session.send("q")
+			time.sleep(TIMEOUTS['RECOVERY'])
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 
-					# отправляем команду show log
-					self.session.sendline("show log")
-					self.session.sendline("n")
+			self.session.sendline("disable clipaging")
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['PROMPT'])
 
-					# ждем накопления данных
-					time.sleep(2)
+			pattern = r"Port\s+\d+(?::\d+)?"
+			res_log = re.findall(pattern, output, re.IGNORECASE)
 
-					# читаем что накопилось в буфере
-					try:
-							output = self.session.read_nonblocking(size=10000, timeout=2).decode(errors="ignore")
-					except:
-							output = ""
+			if res_log:
+				count = len(res_log)
+				print(f"  LOGS: port {port} found {count} times")
+			else:
+				print(f"  LOGS: port {port} not found in logs")
 
-					# выходим из просмотра
-					self.session.send("q")
-					time.sleep(0.5)
-					self.session.expect(["5#", "admin#"], timeout=2)
-
-					# отключаем clipaging обратно (если нужно для следующих команд)
-					self.session.sendline("disable clipaging")
-					self.session.expect(["5#", "admin#"], timeout=2)
-
-					# считаем упоминания порта
-					# port_str = re.escape(str(port))
-					pattern = r"Port\s+\d+(?::\d+)?"
-					res_log = re.findall(pattern, output, re.IGNORECASE)
-
-					if res_log:
-							count = len(res_log)
-							print(f"  LOGS: port {port} found {count} times")
-					else:
-							print(f"  LOGS: port {port} not found in logs")
-
-			except Exception as e:
-					print(f"  Ошибка при проверке show log: {e}")
+		except Exception as e:
+			print(f"  Ошибка при проверке show log: {e}")
+			self._ensure_prompt()
 
 	def check_packet_port(self, port):
 		"""проверка трафика на порту (show packer ports)"""
 		try:
-			# клир буфер перед отправкой команды
-			self.session.sendline("")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			if not self._ensure_prompt():
+				return
 
-			# отправляем команду show packet ports
 			self.session.sendline(f"show packet ports {port}")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			packet_ports = self.session.before.decode("utf-8", errors="ignore")
 
-			# findall ищет все вхождения (RX и TX)
 			matches = re.findall(
 				r"(?:RX|TX) Bytes.*?\d+\s+(\d+)", packet_ports, re.IGNORECASE
 			)
@@ -582,13 +503,14 @@ class DLinkTelnetClient:
 
 		except Exception as e:
 			print(f"  Ошибка при проверке packets: {e}")
+			self._ensure_prompt()
 
 	def check_cable_diagnostic(self, port):
 		"""проверка диагностики кабеля (cable diagnostic port / cable_diag ports)"""
 		try:
-			# очищаем буфер
-			self.session.sendline("")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			if not self._ensure_prompt():
+				return
+
 			prompt = self.session.before.decode("utf-8", errors="ignore")
 
 			if "DGS-1210" in prompt or "1210" in prompt:
@@ -597,9 +519,9 @@ class DLinkTelnetClient:
 				cmd = f"cable_diag ports {port}"
 
 			self.session.sendline(cmd)
-			time.sleep(1)
+			time.sleep(TIMEOUTS['CABLE'])
 			self.session.sendline("")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			cab_diag = self.session.before.decode("utf-8", errors="ignore")
 
 			cab_diag_port = re.search(
@@ -617,21 +539,22 @@ class DLinkTelnetClient:
 
 		except Exception as e:
 			print(f"  Ошибка при диагностике кабеля: {e}")
+			self._ensure_prompt()
 
 	def check_vlan_on_port(self, port):
 		"""проверка VLAN на порту (show vlan ports)"""
 		try:
-			# сразу отправляем команду show vlan ports
+			if not self._ensure_prompt():
+				return
+
 			self.session.sendline(f"show vlan ports {port}")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			data_vlan = self.session.before.decode("utf-8", errors="ignore")
 
-			# универсальная регулярка под разные свитчи
 			vlan_matches = re.findall(
 				r"^\s*(\d+)\s+([X-])\s+([X-])", data_vlan, re.MULTILINE
 			)
 
-			# если не зарегало по универсальной, то пробуем второй (с номером порта в начале строки)
 			if not vlan_matches:
 				vlan_matches = re.findall(
 					r"^\s*\d+(?::\d+)?\s+(\d+)\s+([X-])\s+([X-])",
@@ -654,56 +577,33 @@ class DLinkTelnetClient:
 
 		except Exception as e:
 			print(f"  Ошибка при проверке VLAN: {e}")
+			self._ensure_prompt()
 
 	def check_access_profile(self, port):
 		"""проверка access profile на порту"""
 		try:
-			# очищаем буфер и получаем промпт для определения модели
-			print(f"\n  DEBUG: отправляем пустую строку")
-			# self.session.sendline("")
-			print(f"  DEBUG: ожидаем промпт")
-			self.session.expect(["5#", "admin#"], timeout=1)
+			# получаем промпт для определения модели
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['PROMPT'])
 			prompt = self.session.before.decode("utf-8", errors="ignore")
-			print(f"  DEBUG: получен промпт: {repr(prompt)}")
 
 			# отправляем команду show access_profile
-			print(f"  DEBUG: отправляем команду 'show access_profile'")
 			self.session.sendline("show access_profile")
-			time.sleep(4)
-
-			print(f"  DEBUG: отправляем Enter для возврата")
-			# self.session.sendline("")
-			# self.session.sendline("")
+			time.sleep(TIMEOUTS['ACCESS'])
 
 			try:
-				print(f"  DEBUG: ожидаем промпт после команды")
-				self.session.expect(["5#", "admin#"], timeout=4)
-				print(f"  DEBUG: промпт получен")
-			except Exception as e:
-				print(f"  DEBUG: таймаут, отправляем Ctrl+C")
-				self.session.sendcontrol('c')
-				time.sleep(1)
+				self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['ACCESS'])
+			except Exception:
+				self.session.sendcontrol("c")
+				time.sleep(TIMEOUTS['RECOVERY'])
 				self.session.sendline("")
-				self.session.expect(["5#", "admin#"], timeout=3)
-				print(f"  DEBUG: промпт получен после Ctrl+C")
+				self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['PROMPT'])
 
 			output = self.session.before.decode("utf-8", errors="ignore")
-			print(f"\n  DEBUG - ВЫВОД КОМАНДЫ (первые 500 символов):")
-			print(repr(output[:15000]))
-			print(f"  END DEBUG\n")
 
-			# проверяем, есть ли реальный вывод команды
-			if len(output.strip()) < 50 or "next possible" in output.lower():
-				print(f"  ACL PROFILE: command not supported on this switch")
-				return
-
-			# ищем payload и source mac
 			payload = None
 			source_mac = None
 
 			if "DES-3028" in prompt:
-				print(f"  DEBUG: обнаружен DES-3028")
-				# для 3028 - payload (ищем в двух форматах offset)
 				pattern1 = rf"Access ID : \d+ \n\rPorts\t  : {port}.*?\n\r +26 +0x([0-9A-F]+) 0xffffffff"
 				pattern2 = rf"Access ID : \d+ \n\rPorts\t  : {port}.*?\n\r +28 +0x([0-9A-F]+) 0xffffffff"
 
@@ -713,42 +613,37 @@ class DLinkTelnetClient:
 
 				if match:
 					payload = match.group(1)
-					print(f"  DEBUG: найден payload: {payload}")
 
-				# source mac для 3028
 				mac_pattern = rf"Ports\t  : {port}.*?Source MAC\s*\n\r-----------------\s*\n\r((?:[0-9A-F]{{2}}[-]){{5}}[0-9A-F]{{2}})"
 				mac_match = re.search(mac_pattern, output, re.DOTALL | re.IGNORECASE)
 				if mac_match:
 					source_mac = mac_match.group(1)
 
 			elif "DGS-3000" in prompt:
-				print(f"  DEBUG: обнаружен DGS-3000")
-				# для 3000 - payload
 				pattern = rf"Rule ID.*?Ports:\s*{port}.*?(?:offset_chunk.*?value\s*:\s*(0x[0-9A-F]+).*?){{1,2}}"
 				matches = re.findall(pattern, output, re.DOTALL | re.IGNORECASE)
 				if matches:
 					payload = matches[1] if len(matches) > 1 else matches[0]
 
-				# source mac для 3000
 				mac_pattern = rf"Rule ID.*?Ports:\s*{port}.*?Source MAC\s*:\s*((?:[0-9A-F]{{2}}[-]){{5}}[0-9A-F]{{2}})"
 				mac_match = re.search(mac_pattern, output, re.DOTALL | re.IGNORECASE)
 				if mac_match:
 					source_mac = mac_match.group(1)
 
 			elif "DGS-3120" in prompt:
-				print(f"  DEBUG: обнаружен DGS-3120")
-				# для 3120 - payload (ищем в двух форматах)
-				pattern1 = rf"Ports:\s*{port}.*?offset_chunk_1.*?value\s*:\s*0x([0-9A-F]+)"
-				pattern2 = rf"Ports:\s*{port}.*?offset_chunk_2.*?value\s*:\s*0x([0-9A-F]+)"
+				# разбиваем вывод на блоки правил
+				blocks = re.split(r'--------------------------------------------------------------------------------', output)
 
-				match1 = re.search(pattern1, output, re.DOTALL | re.IGNORECASE)
-				match2 = re.search(pattern2, output, re.DOTALL | re.IGNORECASE)
-
-				if match1 and match2:
-					# если есть два чанка, берем второй
-					payload = match2.group(1)
-				elif match1:
-					payload = match1.group(1)
+				for block in blocks:
+					if f"Ports: {port}" in block:
+						# считаем количество offset_chunk в блоке
+						chunk_count = len(re.findall(r'offset_chunk', block))
+						if chunk_count == 1:
+							# это правило с одним чанком
+							match = re.search(r'value\s*:\s*(0x[0-9A-F]+)', block, re.IGNORECASE)
+							if match:
+								payload = match.group(1)
+								break
 
 				# source mac для 3120
 				mac_pattern = rf"Ports:\s*{port}.*?Source MAC\s*:\s*((?:[0-9A-F]{{2}}[-]){{5}}[0-9A-F]{{2}})"
@@ -757,14 +652,11 @@ class DLinkTelnetClient:
 					source_mac = mac_match.group(1)
 
 			elif "DGS-1210" in prompt:
-				print(f"  DEBUG: обнаружен DGS-1210")
-				# для 1210 - payload
 				pattern = rf"Ports:\s*{port}\s+.*?Filter Value = (0x[0-9A-F]+)"
 				matches = re.findall(pattern, output, re.DOTALL | re.IGNORECASE)
 				if matches:
 					payload = matches[-1]
 
-				# source mac для 1210
 				mac_pattern = rf"Ports:\s*{port}.*?Source MAC\s*:\s*((?:[0-9A-F]{{2}}[-]){{5}}[0-9A-F]{{2}})"
 				mac_match = re.search(mac_pattern, output, re.DOTALL | re.IGNORECASE)
 				if mac_match:
@@ -773,11 +665,24 @@ class DLinkTelnetClient:
 			else:
 				print(f"  ACL PROFILE: unsupported switch type (prompt: {repr(prompt)})")
 
-			# выводим результаты
 			if payload:
-				print(f"  ACL PAYLOAD (port {port}): {payload}")
-			if source_mac:
+				# очищаем от 0x если есть
+				clean_payload = payload.replace('0x', '')
+				# проверяем, что длина достаточная для IP (8 символов)
+				if len(clean_payload) == 8:
+					# разбиваем на октеты и конвертируем в десятичные
+					ip_parts = []
+					for i in range(0, 8, 2):
+						octet = int(clean_payload[i:i+2], 16)
+						ip_parts.append(str(octet))
+					ip_address = ".".join(ip_parts)
+					print(f"  ACL PAYLOAD (port {port}): {payload} -> {ip_address}")
+				else:
+					print(f"  ACL PAYLOAD (port {port}): {payload}")
+
+			if source_mac and source_mac != "00-00-00-00-00-00":
 				print(f"  ACL SOURCE MAC (port {port}): {source_mac}")
+
 			if not payload and not source_mac:
 				print(f"  ACL PROFILE (port {port}): not found")
 
@@ -794,6 +699,9 @@ class DLinkTelnetClient:
 		print("  " + "#" * 50)
 		print()
 
+		# гарантируем промпт перед началом
+		self._ensure_prompt()
+
 		self.check_port_status(port)
 		self.check_len_log(port)
 		mac_list = self.check_mac_addresses(port)
@@ -802,12 +710,11 @@ class DLinkTelnetClient:
 		self.check_errors_port(port)
 		self.check_packet_port(port)
 
-		# если ип свитча и гейта одинаковый, проверяем на нем арпу
 		if switch_ip_from_db and gateway_from_db and switch_ip_from_db == gateway_from_db:
-			# проверка арпы на л2
+			self._ensure_prompt()
 			self.session.sendline(f"show arpentry ipaddress {user_ip}")
-			time.sleep(0.5)
-			self.session.expect(["5#", "admin#"], timeout=1)
+			time.sleep(TIMEOUTS['RECOVERY'])
+			self.session.expect(["5#", "admin#"], timeout=TIMEOUTS['COMMAND'])
 			arp_data = self.session.before.decode("utf-8", errors="ignore")
 
 			arp_mac = None
@@ -829,7 +736,6 @@ class DLinkTelnetClient:
 			else:
 				print("  ARP: not found on local switch")
 		else:
-			# если ип свитча не совпадает с ип шлюза — то смотрим на л2 дефолт гейтвей и по нему чекаем арп
 			self.check_gateway_l3()
 			if hasattr(self, "gateway_ip") and self.gateway_ip:
 				self.check_arp_on_gateway(user_ip, mac_list)
@@ -843,14 +749,12 @@ class DLinkTelnetClient:
 
 # ==================== MAIN PROG ====================
 
-
 def print_header():
 	"""вывод результатов"""
 	print("\n" + "*" * 70)
 	print("DIAGNOSTICA CHLENSKOGO".center(70))
 	print("*" * 70)
 	print()
-
 
 def print_user_info(user, idx):
 	"""информация юза"""
@@ -865,20 +769,16 @@ def print_user_info(user, idx):
 	print(f"  DHCP_type:  {user['dhcp_type'] if user['dhcp_type'] else 'не указан'}")
 	print()
 
-
 def main():
 	print_header()
-	# инициализация клиента БД
 	db = DatabaseClient(cfg.DB_CONFIG)
 
-	# подключаемся к БД
 	if not db.connect():
 		print("Oops, it didn't work")
 		sys.exit(1)
 
 	try:
 		while True:
-			# ввод номера
 			search = input("us_num: ").strip()
 
 			if search.lower() in ["exit", "quit", "q", "выход"]:
@@ -891,7 +791,6 @@ def main():
 
 			print(f"\nFind user with num: {search}")
 
-			# получаем данные из БД
 			users = db.get_user_by_number(search)
 
 			if not users:
@@ -901,19 +800,15 @@ def main():
 			print()
 
 			for user in users:
-				if user["switch"]:  # если есть IP свитча
+				if user["switch"]:
 					switch_ip = user["switch"]
-					# проверяем, что это IP
 					ip_pattern = r"^(\d{1,3}\.){3}\d{1,3}$"
 					if re.match(ip_pattern, switch_ip):
-						# получаем имя свитча из БД
 						user["switch_name"] = db.get_switch_name_by_ip(switch_ip)
 
-			# выводим найденные записи
 			for idx, user in enumerate(users, 1):
 				print_user_info(user, idx)
 
-			# выбор записи для диагностики
 			selected_user = None
 
 			if len(users) == 1:
@@ -921,7 +816,6 @@ def main():
 				if choice in ["y", "yes", "да", "д"]:
 					selected_user = users[0]
 
-			# запуск диагностики
 			if selected_user:
 				switch_info = selected_user["switch"]
 				port = selected_user["port"]
@@ -934,38 +828,26 @@ def main():
 					print("port number not specified")
 					continue
 
-				# проверка является ли switch_info IP адр
 				ip_pattern = r"^(\d{1,3}\.){3}\d{1,3}$"
 
 				if re.match(ip_pattern, switch_info):
-					# это IP адр
 					switch_ip = switch_info
-
 				else:
-					# это имя свитча, нужно запросить IP
 					print(f"\nswitch: {switch_info}")
-					switch_ip = input(
-						f"Enter IP-add {switch_info}: "
-					).strip()
-
+					switch_ip = input(f"Enter IP-add {switch_info}: ").strip()
 					if not switch_ip:
 						print("IP address not specified")
 						continue
 
-				# клиент для подключения к свитчу
 				switch = DLinkTelnetClient(host=switch_ip)
 
-				# коннект
 				if switch.connect():
-					# запуск диагностики порта
 					switch.run_diagnostic(port, selected_user["ip"], switch_ip, selected_user["gate"])
-
-					# закрываем соединение
 					switch.disconnect()
 				else:
 					print("Failed to connect")
 
-			print("Let's try again?")  # пустая строка перед следующим поиском
+			print("Let's try again?")
 
 	except KeyboardInterrupt:
 		print("\n\nSCRIPT STOPPED")
