@@ -655,6 +655,129 @@ class DLinkTelnetClient:
 		except Exception as e:
 			print(f"  Ошибка при проверке VLAN: {e}")
 
+	def check_access_profile(self, port):
+		"""проверка access profile на порту"""
+		try:
+			# очищаем буфер и получаем промпт для определения модели
+			print(f"\n  DEBUG: отправляем пустую строку")
+			# self.session.sendline("")
+			print(f"  DEBUG: ожидаем промпт")
+			self.session.expect(["5#", "admin#"], timeout=1)
+			prompt = self.session.before.decode("utf-8", errors="ignore")
+			print(f"  DEBUG: получен промпт: {repr(prompt)}")
+
+			# отправляем команду show access_profile
+			print(f"  DEBUG: отправляем команду 'show access_profile'")
+			self.session.sendline("show access_profile")
+			time.sleep(4)
+
+			print(f"  DEBUG: отправляем Enter для возврата")
+			# self.session.sendline("")
+			# self.session.sendline("")
+
+			try:
+				print(f"  DEBUG: ожидаем промпт после команды")
+				self.session.expect(["5#", "admin#"], timeout=4)
+				print(f"  DEBUG: промпт получен")
+			except Exception as e:
+				print(f"  DEBUG: таймаут, отправляем Ctrl+C")
+				self.session.sendcontrol('c')
+				time.sleep(1)
+				self.session.sendline("")
+				self.session.expect(["5#", "admin#"], timeout=3)
+				print(f"  DEBUG: промпт получен после Ctrl+C")
+
+			output = self.session.before.decode("utf-8", errors="ignore")
+			print(f"\n  DEBUG - ВЫВОД КОМАНДЫ (первые 500 символов):")
+			print(repr(output[:10000]))
+			print(f"  END DEBUG\n")
+
+			# проверяем, есть ли реальный вывод команды
+			if len(output.strip()) < 50 or "next possible" in output.lower():
+				print(f"  ACL PROFILE: command not supported on this switch")
+				return
+
+			# ищем payload и source mac
+			payload = None
+			source_mac = None
+
+			if "DES-3028" in prompt:
+				print(f"  DEBUG: обнаружен DES-3028")
+				# для 3028 - payload
+				pattern = rf"Ports\s*:\s*{port}\s*.*?Offset\s+26\s+0x([0-9A-F]+)"
+				match = re.search(pattern, output, re.DOTALL | re.IGNORECASE)
+				if match:
+					payload = match.group(1)
+
+				# source mac для 3028
+				mac_pattern = rf"Ports\s*:\s*{port}.*?Source MAC\s*:\s*((?:[0-9A-F]{{2}}[-]){{5}}[0-9A-F]{{2}})"
+				mac_match = re.search(mac_pattern, output, re.DOTALL | re.IGNORECASE)
+				if mac_match:
+					source_mac = mac_match.group(1)
+
+			elif "DGS-3000" in prompt:
+				print(f"  DEBUG: обнаружен DGS-3000")
+				# для 3000 - payload
+				pattern = rf"Rule ID.*?Ports:\s*{port}.*?(?:offset_chunk.*?value\s*:\s*(0x[0-9A-F]+).*?){{1,2}}"
+				matches = re.findall(pattern, output, re.DOTALL | re.IGNORECASE)
+				if matches:
+					payload = matches[1] if len(matches) > 1 else matches[0]
+
+				# source mac для 3000
+				mac_pattern = rf"Rule ID.*?Ports:\s*{port}.*?Source MAC\s*:\s*((?:[0-9A-F]{{2}}[-]){{5}}[0-9A-F]{{2}})"
+				mac_match = re.search(mac_pattern, output, re.DOTALL | re.IGNORECASE)
+				if mac_match:
+					source_mac = mac_match.group(1)
+
+			elif "DGS-3120" in prompt:
+				print(f"  DEBUG: обнаружен DGS-3120")
+				# для 3120 - payload (ищем в двух форматах)
+				pattern1 = rf"Ports:\s*{port}.*?offset_chunk_1.*?value\s*:\s*0x([0-9A-F]+)"
+				pattern2 = rf"Ports:\s*{port}.*?offset_chunk_2.*?value\s*:\s*0x([0-9A-F]+)"
+
+				match1 = re.search(pattern1, output, re.DOTALL | re.IGNORECASE)
+				match2 = re.search(pattern2, output, re.DOTALL | re.IGNORECASE)
+
+				if match1 and match2:
+					# если есть два чанка, берем второй
+					payload = match2.group(1)
+				elif match1:
+					payload = match1.group(1)
+
+				# source mac для 3120
+				mac_pattern = rf"Ports:\s*{port}.*?Source MAC\s*:\s*((?:[0-9A-F]{{2}}[-]){{5}}[0-9A-F]{{2}})"
+				mac_match = re.search(mac_pattern, output, re.DOTALL | re.IGNORECASE)
+				if mac_match:
+					source_mac = mac_match.group(1)
+
+			elif "DGS-1210" in prompt:
+				print(f"  DEBUG: обнаружен DGS-1210")
+				# для 1210 - payload
+				pattern = rf"Ports:\s*{port}\s+.*?Filter Value = (0x[0-9A-F]+)"
+				matches = re.findall(pattern, output, re.DOTALL | re.IGNORECASE)
+				if matches:
+					payload = matches[-1]
+
+				# source mac для 1210
+				mac_pattern = rf"Ports:\s*{port}.*?Source MAC\s*:\s*((?:[0-9A-F]{{2}}[-]){{5}}[0-9A-F]{{2}})"
+				mac_match = re.search(mac_pattern, output, re.DOTALL | re.IGNORECASE)
+				if mac_match:
+					source_mac = mac_match.group(1)
+
+			else:
+				print(f"  ACL PROFILE: unsupported switch type (prompt: {repr(prompt)})")
+
+			# выводим результаты
+			if payload:
+				print(f"  ACL PAYLOAD (port {port}): {payload}")
+			if source_mac:
+				print(f"  ACL SOURCE MAC (port {port}): {source_mac}")
+			if not payload and not source_mac:
+				print(f"  ACL PROFILE (port {port}): not found")
+
+		except Exception as e:
+			print(f"  Ошибка при проверке access profile: {e}")
+
 	def run_diagnostic(self, port, user_ip=None, switch_ip_from_db=None, gateway_from_db=None):
 		"""запуск диагностики порта"""
 		if not self.connected:
@@ -707,6 +830,7 @@ class DLinkTelnetClient:
 
 		self.check_utilization_cpu()
 		self.check_cable_diagnostic(port)
+		self.check_access_profile(port)
 
 		print("\n  " + "#" * 50)
 
