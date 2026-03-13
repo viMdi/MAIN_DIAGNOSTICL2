@@ -69,7 +69,7 @@ myvenv\Scripts\activate
 source myvenv/bin/activate
 
 # Установить зависимости
-pip install -r requirements.txt
+pip install pymysql pexpect
 
 # Создать файл конфигурации из примера
 cp cfg_example.py cfg.py
@@ -78,7 +78,7 @@ cp cfg_example.py cfg.py
 Использование
 bash
 
-python MAIN_DIAGA.py
+python to_sw.py
 
 После запуска ввести номер юзера. Скрипт покажет найденные записи и предложит запустить диагностику.
 Результат — через 5–7 секунд.
