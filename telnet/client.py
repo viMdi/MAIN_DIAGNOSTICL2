@@ -35,7 +35,6 @@ class DLinkTelnetClient:
             )
             return True
         except:
-            # пробуем восстановиться
             try:
                 self.session.sendcontrol("c")
                 time.sleep(TIMEOUTS["RECOVERY"])
@@ -46,6 +45,78 @@ class DLinkTelnetClient:
                 return True
             except:
                 return False
+
+    def _send_command(self, session, cmd):
+        """отправка команды и получение вывода"""
+        session.sendline(cmd)
+        time.sleep(0.3)
+        session.expect(["5#", "admin#", "Switch#", "#"], timeout=TIMEOUTS["COMMAND"])
+        return session.before.decode("utf-8", errors="ignore")
+
+    def _parse_arp_response(self, data, user_ip):
+        """парсинг ARP ответа"""
+        for line in data.split("\n"):
+            if "show arpentry" in line or "sh arp" in line or "Command:" in line:
+                continue
+            if user_ip in line:
+                mac_match = re.search(
+                    r"((?:[A-F0-9]{2}[-]){5}[A-F0-9]{2})", line, re.IGNORECASE
+                )
+                if mac_match:
+                    return mac_match.group(1).upper(), True
+        return None, False
+
+    def _try_arp_commands(self, session, user_ip):
+        """попытка двух вариантов ARP команд"""
+        data = self._send_command(session, f"show arpentry ipaddress {user_ip}")
+
+        if "Invalid" in data or "^" in data or not data.strip():
+            data = self._send_command(session, f"sh arp {user_ip}")
+
+        return self._parse_arp_response(data, user_ip)
+
+    def _check_gateway_connection(
+        self, gateway_ip, user_ip, mac_from_l2, is_secondary=False
+    ):
+        """проверка ARP на указанном шлюзе"""
+        gw = DLinkTelnetClient(gateway_ip, disable_paging=False)
+
+        if not gw.connect(quiet=True):
+            if is_secondary:
+                print(f"  ARP: failed to connect to the gateway {gateway_ip}")
+            return None
+
+        arp_mac, ip_found = self._try_arp_commands(gw.session, user_ip)
+
+        result = {"mac": arp_mac, "ip_found": ip_found, "gw": gw, "gateway": gateway_ip}
+        return result
+
+    def _print_arp_result(self, result, mac_from_l2, is_secondary=False):
+        """вывод результата ARP проверки"""
+        if not result:
+            return
+
+        arp_mac = result["mac"]
+        ip_found = result["ip_found"]
+        location = "secondary gateway" if is_secondary else "L3"
+
+        if not mac_from_l2:
+            print("  ARP: no result (no MAC on L2)")
+        elif not ip_found:
+            print(f"  ARP: no result (IP not found on {location})")
+        elif len(mac_from_l2) > 5:
+            print(
+                f"  ARP: {arp_mac if arp_mac else 'MAC not found'} (on port {len(mac_from_l2)} MAC-address, check the port manually)"
+            )
+        elif arp_mac and arp_mac in mac_from_l2 and ip_found:
+            location_msg = f" - found on {location}" if is_secondary else ""
+            print(f"  ARP: OK (IP and MAC match){location_msg}")
+        elif arp_mac:
+            print(
+                f"  ARP: NOT MATCH (L2: {', '.join(mac_from_l2)} | {location}: {arp_mac})"
+            )
+        else:
+            print(f"  ARP: no result (arpentry not found on {location})")
 
     def connect(self, quiet=False):
         try:
@@ -101,15 +172,9 @@ class DLinkTelnetClient:
             if not self._ensure_prompt():
                 return
 
-            self.session.sendline(f"show ports {port}")
-            self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["COMMAND"])
-            data_port = self.session.before.decode("utf-8", errors="ignore")
-
-            res = re.search(r"\b\d+[M]\S+|(Li\S+.\S+)", data_port)
-            if res:
-                print(f"  LINK STATUS: {res.group()}")
-            else:
-                print("  LINK STATUS: not defined")
+            data = self._send_command(self.session, f"show ports {port}")
+            res = re.search(r"\b\d+[M]\S+|(Li\S+.\S+)", data)
+            print(f"  LINK STATUS: {res.group() if res else 'not defined'}")
 
         except Exception as e:
             print(f"  Ошибка при проверке порта: {e}")
@@ -121,13 +186,11 @@ class DLinkTelnetClient:
             if not self._ensure_prompt():
                 return []
 
-            self.session.sendline(f"show fdb port {port}")
-            self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["COMMAND"])
-            data_fdb = self.session.before.decode("utf-8", errors="ignore")
+            data = self._send_command(self.session, f"show fdb port {port}")
 
             res_mac = re.findall(
                 r"^\s*\d+\s+\S+\s+((?:[A-F0-9]{2}[-]){5}[A-F0-9]{2})",
-                data_fdb,
+                data,
                 re.MULTILINE | re.IGNORECASE,
             )
 
@@ -135,7 +198,7 @@ class DLinkTelnetClient:
                 mac_list = [mac.upper() for mac in res_mac]
                 total = len(mac_list)
 
-                type_match = re.search(r"(Dynamic|Permanent)", data_fdb, re.IGNORECASE)
+                type_match = re.search(r"(Dynamic|Permanent)", data, re.IGNORECASE)
                 mac_type = type_match.group(1) if type_match else "no result"
 
                 if total > 4:
@@ -160,15 +223,9 @@ class DLinkTelnetClient:
             if not self._ensure_prompt():
                 return
 
-            self.session.sendline("show dhcp_relay")
-            self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["COMMAND"])
-            dhcp_relay = self.session.before.decode("utf-8", errors="ignore")
-
-            res_dhcp = re.search(r"R\S+\s\S+\s+[:].(\S+)", dhcp_relay)
-            if res_dhcp:
-                print(f"  DHCP_RELAY: {res_dhcp.group(1)}")
-            else:
-                print("  DHCP_RELAY: not defined")
+            data = self._send_command(self.session, "show dhcp_relay")
+            res_dhcp = re.search(r"R\S+\s\S+\s+[:].(\S+)", data)
+            print(f"  DHCP_RELAY: {res_dhcp.group(1) if res_dhcp else 'not defined'}")
 
         except Exception as e:
             print(f"  Ошибка при проверке dhcp: {e}")
@@ -180,13 +237,9 @@ class DLinkTelnetClient:
             if not self._ensure_prompt():
                 return
 
-            self.session.sendline("show switch")
-            time.sleep(0.3)
-            self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["COMMAND"])
-            res_gateway = self.session.before.decode("utf-8", errors="ignore")
-
+            data = self._send_command(self.session, "show switch")
             res_def_gate = re.search(
-                r"Default Gateway\s*:\s*(\S+)", res_gateway, re.IGNORECASE
+                r"Default Gateway\s*:\s*(\S+)", data, re.IGNORECASE
             )
             if res_def_gate:
                 self.gateway_ip = res_def_gate.group(1)
@@ -204,177 +257,53 @@ class DLinkTelnetClient:
             return
 
         try:
-            gw = DLinkTelnetClient(self.gateway_ip, disable_paging=False)
+            result = self._check_gateway_connection(
+                self.gateway_ip, user_ip, mac_from_l2
+            )
 
-            if gw.connect(quiet=True):
-                arp_data = ""
-
-                gw.session.sendline(f"show arpentry ipaddress {user_ip}")
-                time.sleep(0.3)
-                gw.session.expect(
-                    ["5#", "admin#", "Switch#", "#"], timeout=TIMEOUTS["COMMAND"]
+            if result and not result["ip_found"] and not result["mac"]:
+                route_data = self._send_command(
+                    result["gw"].session, f"show iproute {user_ip}"
                 )
-                arp_data = gw.session.before.decode("utf-8", errors="ignore")
+                gateway_match = re.search(
+                    r"\d+\.\d+\.\d+\.\d+/\d+\s+(\d+\.\d+\.\d+\.\d+)", route_data
+                )
 
-                if "Invalid" in arp_data or "^" in arp_data or not arp_data.strip():
-                    gw.session.sendline(f"sh arp {user_ip}")
-                    time.sleep(0.3)
-                    gw.session.expect(
-                        ["5#", "admin#", "Switch#", "#"], timeout=TIMEOUTS["COMMAND"]
-                    )
-                    arp_data = gw.session.before.decode("utf-8", errors="ignore")
+                if gateway_match:
+                    new_gateway = gateway_match.group(1)
+                    print(f"  ARP: gateway found {new_gateway}, trying to connect...")
 
-                arp_mac = None
-                ip_found = False
+                    try:
+                        result["gw"].session.sendline("logout")
+                        result["gw"].session.close()
+                    except:
+                        pass
 
-                for line in arp_data.split("\n"):
-                    if (
-                        "show arpentry" in line
-                        or "sh arp" in line
-                        or "Command:" in line
-                    ):
-                        continue
-                    if user_ip in line:
-                        ip_found = True
-                        mac_match = re.search(
-                            r"((?:[A-F0-9]{2}[-]){5}[A-F0-9]{2})", line, re.IGNORECASE
-                        )
-                        if mac_match:
-                            arp_mac = mac_match.group(1).upper()
-                            break
-
-                if not ip_found and not arp_mac:
-                    gw.session.sendline(f"show iproute {user_ip}")
-                    time.sleep(0.3)
-                    gw.session.expect(
-                        ["5#", "admin#", "Switch#", "#"], timeout=TIMEOUTS["COMMAND"]
-                    )
-                    route_data = gw.session.before.decode("utf-8", errors="ignore")
-
-                    gateway_match = re.search(
-                        r"\d+\.\d+\.\d+\.\d+/\d+\s+(\d+\.\d+\.\d+\.\d+)", route_data
+                    secondary_result = self._check_gateway_connection(
+                        new_gateway, user_ip, mac_from_l2, is_secondary=True
                     )
 
-                    if gateway_match:
-                        new_gateway = gateway_match.group(1)
-                        print(
-                            f"  ARP: gateway found {new_gateway}, trying to connect..."
+                    if secondary_result:
+                        self._print_arp_result(
+                            secondary_result, mac_from_l2, is_secondary=True
                         )
 
                         try:
-                            gw.session.sendline("logout")
-                            gw.session.close()
+                            secondary_result["gw"].session.sendline("logout")
+                            secondary_result["gw"].session.close()
                         except:
                             pass
 
-                        new_gw = DLinkTelnetClient(new_gateway, disable_paging=False)
-
-                        if new_gw.connect(quiet=True):
-                            new_gw.session.sendline(
-                                f"show arpentry ipaddress {user_ip}"
-                            )
-                            time.sleep(0.3)
-                            new_gw.session.expect(
-                                ["5#", "admin#", "Switch#", "#"],
-                                timeout=TIMEOUTS["COMMAND"],
-                            )
-                            new_arp_data = new_gw.session.before.decode(
-                                "utf-8", errors="ignore"
-                            )
-
-                            if (
-                                "Invalid" in new_arp_data
-                                or "^" in new_arp_data
-                                or not new_arp_data.strip()
-                            ):
-                                new_gw.session.sendline(f"sh arp {user_ip}")
-                                time.sleep(0.3)
-                                new_gw.session.expect(
-                                    ["5#", "admin#", "Switch#", "#"],
-                                    timeout=TIMEOUTS["COMMAND"],
-                                )
-                                new_arp_data = new_gw.session.before.decode(
-                                    "utf-8", errors="ignore"
-                                )
-
-                            new_arp_mac = None
-                            new_ip_found = False
-
-                            for line in new_arp_data.split("\n"):
-                                if (
-                                    "show arpentry" in line
-                                    or "sh arp" in line
-                                    or "Command:" in line
-                                ):
-                                    continue
-                                if user_ip in line:
-                                    new_ip_found = True
-                                    mac_match = re.search(
-                                        r"((?:[A-F0-9]{2}[-]){5}[A-F0-9]{2})",
-                                        line,
-                                        re.IGNORECASE,
-                                    )
-                                    if mac_match:
-                                        new_arp_mac = mac_match.group(1).upper()
-                                        break
-
-                            if not mac_from_l2:
-                                print("  ARP: no result (no MAC on L2)")
-                            elif not new_ip_found:
-                                print(
-                                    "  ARP: no result (IP not found on secondary gateway)"
-                                )
-                            elif (
-                                new_arp_mac
-                                and new_arp_mac in mac_from_l2
-                                and new_ip_found
-                            ):
-                                print(
-                                    "  ARP: OK (IP and MAC match) - found on secondary gateway"
-                                )
-                            elif new_arp_mac:
-                                print(
-                                    f"  ARP: NOT MATCH (L2: {', '.join(mac_from_l2)} | L3: {new_arp_mac}) - on secondary gateway"
-                                )
-                            else:
-                                print(
-                                    "  ARP: no result (arpentry not found) - on secondary gateway"
-                                )
-
-                            try:
-                                new_gw.session.sendline("logout")
-                                new_gw.session.close()
-                            except:
-                                pass
-
-                            return
-                        else:
-                            print(
-                                f"  ARP: failed to connect to the gateway {new_gateway}"
-                            )
-                    else:
-                        print("  ARP: route not found")
-
-                elif not mac_from_l2:
-                    print("  ARP: no result (no MAC on L2)")
-                elif not ip_found:
-                    print("  ARP: no result (IP not found on L3)")
-                elif len(mac_from_l2) > 5:
-                    print(
-                        f"  ARP: {arp_mac if arp_mac else 'MAC not found'} (on port {len(mac_from_l2)} MAC-address, check the port manually)"
-                    )
-                elif arp_mac and arp_mac in mac_from_l2 and ip_found:
-                    print("  ARP: OK (IP and MAC match)")
-                elif arp_mac:
-                    print(
-                        f"  ARP: NOT MATCH (L2: {', '.join(mac_from_l2)} | L3: {arp_mac})"
-                    )
+                        return
                 else:
-                    print("  ARP: no result (arpentry not found)")
+                    print("  ARP: route not found")
+
+            if result:
+                self._print_arp_result(result, mac_from_l2)
 
                 try:
-                    gw.session.sendline("logout")
-                    gw.session.close()
+                    result["gw"].session.sendline("logout")
+                    result["gw"].session.close()
                 except:
                     pass
 
@@ -387,15 +316,11 @@ class DLinkTelnetClient:
             if not self._ensure_prompt():
                 return
 
-            self.session.sendline("show utilization cpu")
-            self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["COMMAND"])
-            utilization_cpu = self.session.before.decode("utf-8", errors="ignore")
-
-            res_util_cpu = re.search(r"Five.*?(\d+\s*%)", utilization_cpu)
-            if res_util_cpu:
-                print(f"  UTIL_CPU: {res_util_cpu.group(1)}")
-            else:
-                print("  UTIL_CPU: not defined")
+            data = self._send_command(self.session, "show utilization cpu")
+            res_util_cpu = re.search(r"Five.*?(\d+\s*%)", data)
+            print(
+                f"  UTIL_CPU: {res_util_cpu.group(1) if res_util_cpu else 'not defined'}"
+            )
 
         except Exception as e:
             print(f"  Ошибка при проверке utilization_cpu: {e}")
@@ -407,15 +332,12 @@ class DLinkTelnetClient:
             if not self._ensure_prompt():
                 return
 
-            self.session.sendline(f"show error ports {port}")
-            self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["COMMAND"])
-            error_ports = self.session.before.decode("utf-8", errors="ignore")
+            data = self._send_command(self.session, f"show error ports {port}")
+            res_error_ports = re.search(r"CRC Error\s+(\d+)", data)
+            print(
+                f"  ERRORS PORT: {res_error_ports.group(1) if res_error_ports else 'not defined'}"
+            )
 
-            res_error_ports = re.search(r"CRC Error\s+(\d+)", error_ports)
-            if res_error_ports:
-                print(f"  ERRORS PORT: {res_error_ports.group(1)}")
-            else:
-                print("  ERRORS PORT: not defined")
         except Exception as e:
             print(f"  Ошибка при проверке error: {e}")
             self._ensure_prompt()
@@ -451,8 +373,7 @@ class DLinkTelnetClient:
             res_log = re.findall(pattern, output, re.IGNORECASE)
 
             if res_log:
-                count = len(res_log)
-                print(f"  LOGS: port {port} found {count} times")
+                print(f"  LOGS: port {port} found {len(res_log)} times")
             else:
                 print(f"  LOGS: port {port} not found in logs")
 
@@ -466,13 +387,9 @@ class DLinkTelnetClient:
             if not self._ensure_prompt():
                 return
 
-            self.session.sendline(f"show packet ports {port}")
-            self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["COMMAND"])
-            packet_ports = self.session.before.decode("utf-8", errors="ignore")
+            data = self._send_command(self.session, f"show packet ports {port}")
 
-            matches = re.findall(
-                r"(?:RX|TX) Bytes.*?\d+\s+(\d+)", packet_ports, re.IGNORECASE
-            )
+            matches = re.findall(r"(?:RX|TX) Bytes.*?\d+\s+(\d+)", data, re.IGNORECASE)
             rx_bytes = int(matches[0]) if len(matches) > 0 else 0
             tx_bytes = int(matches[1]) if len(matches) > 1 else 0
 
@@ -529,18 +446,16 @@ class DLinkTelnetClient:
             if not self._ensure_prompt():
                 return
 
-            self.session.sendline(f"show vlan ports {port}")
-            self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["COMMAND"])
-            data_vlan = self.session.before.decode("utf-8", errors="ignore")
+            data = self._send_command(self.session, f"show vlan ports {port}")
 
             vlan_matches = re.findall(
-                r"^\s*(\d+)\s+([X-])\s+([X-])", data_vlan, re.MULTILINE
+                r"^\s*(\d+)\s+([X-])\s+([X-])", data, re.MULTILINE
             )
 
             if not vlan_matches:
                 vlan_matches = re.findall(
                     r"^\s*\d+(?::\d+)?\s+(\d+)\s+([X-])\s+([X-])",
-                    data_vlan,
+                    data,
                     re.MULTILINE,
                 )
 
@@ -564,11 +479,9 @@ class DLinkTelnetClient:
     def check_access_profile(self, port):
         """проверка access profile на порту"""
         try:
-            # получаем промпт для определения модели
             self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["PROMPT"])
             prompt = self.session.before.decode("utf-8", errors="ignore")
 
-            # отправляем команду show access_profile
             self.session.sendline("show access_profile")
             time.sleep(TIMEOUTS["ACCESS"])
 
@@ -613,7 +526,6 @@ class DLinkTelnetClient:
                     source_mac = mac_match.group(1)
 
             elif "DGS-3120" in prompt:
-                # разбиваем вывод на блоки правил
                 blocks = re.split(
                     r"--------------------------------------------------------------------------------",
                     output,
@@ -621,10 +533,8 @@ class DLinkTelnetClient:
 
                 for block in blocks:
                     if f"Ports: {port}" in block:
-                        # считаем количество offset_chunk в блоке
                         chunk_count = len(re.findall(r"offset_chunk", block))
                         if chunk_count == 1:
-                            # это правило с одним чанком
                             match = re.search(
                                 r"value\s*:\s*(0x[0-9A-F]+)", block, re.IGNORECASE
                             )
@@ -632,7 +542,6 @@ class DLinkTelnetClient:
                                 payload = match.group(1)
                                 break
 
-                # source mac для 3120
                 mac_pattern = rf"Ports:\s*{port}.*?Source MAC\s*:\s*((?:[0-9A-F]{{2}}[-]){{5}}[0-9A-F]{{2}})"
                 mac_match = re.search(mac_pattern, output, re.DOTALL | re.IGNORECASE)
                 if mac_match:
@@ -655,11 +564,8 @@ class DLinkTelnetClient:
                 )
 
             if payload:
-                # очищаем от 0x если есть
                 clean_payload = payload.replace("0x", "")
-                # проверяем, что длина достаточная для IP (8 символов)
                 if len(clean_payload) == 8:
-                    # разбиваем на октеты и конвертируем в десятичные
                     ip_parts = []
                     for i in range(0, 8, 2):
                         octet = int(clean_payload[i : i + 2], 16)
@@ -690,7 +596,6 @@ class DLinkTelnetClient:
         print("  " + "#" * 50)
         print()
 
-        # гарантируем промпт перед началом
         self._ensure_prompt()
 
         self.check_port_status(port)
@@ -707,22 +612,10 @@ class DLinkTelnetClient:
             and switch_ip_from_db == gateway_from_db
         ):
             self._ensure_prompt()
-            self.session.sendline(f"show arpentry ipaddress {user_ip}")
-            time.sleep(TIMEOUTS["RECOVERY"])
-            self.session.expect(["5#", "admin#"], timeout=TIMEOUTS["COMMAND"])
-            arp_data = self.session.before.decode("utf-8", errors="ignore")
-
-            arp_mac = None
-            for line in arp_data.split("\n"):
-                if "show arpentry" in line or "Command:" in line:
-                    continue
-                if user_ip in line:
-                    mac_match = re.search(
-                        r"((?:[A-F0-9]{2}[-]){5}[A-F0-9]{2})", line, re.IGNORECASE
-                    )
-                    if mac_match:
-                        arp_mac = mac_match.group(1).upper()
-                        break
+            data = self._send_command(
+                self.session, f"show arpentry ipaddress {user_ip}"
+            )
+            arp_mac, ip_found = self._parse_arp_response(data, user_ip)
 
             if arp_mac and arp_mac in mac_list:
                 print("  ARP: OK (IP and MAC match on local switch)")
